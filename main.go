@@ -1,51 +1,50 @@
 package main
 
 import (
-	"log"
+	"fmt"
 	"net/http"
-	"os"
+
+	"github.com/danielgtaylor/huma/v2"
+	"github.com/danielgtaylor/huma/v2/adapters/humago"
+	"github.com/danielgtaylor/huma/v2/humacli"
 )
 
-func newMux(h *Handler) *http.ServeMux {
-	mux := http.NewServeMux()
+// Options defines CLI flags for the server.
+type Options struct {
+	Port int `help:"Port to listen on" short:"p" default:"8080"`
+}
 
-	// Public routes
-	mux.HandleFunc("POST /users", h.registerUser)
-	mux.HandleFunc("POST /sessions", h.login)
-
-	// Authenticated routes
-	mux.HandleFunc("GET /users/{id}", h.requireAuth(h.getUser))
-	mux.HandleFunc("DELETE /users/{id}", h.requireAuth(h.deleteUser))
-	mux.HandleFunc("DELETE /sessions", h.requireAuth(h.logout))
-	mux.HandleFunc("GET /lists", h.requireAuth(h.listLists))
-	mux.HandleFunc("POST /lists", h.requireAuth(h.createList))
-	mux.HandleFunc("DELETE /lists/{listID}", h.requireAuth(h.deleteList))
-	mux.HandleFunc("POST /lists/{listID}/editors", h.requireAuth(h.inviteEditor))
-	mux.HandleFunc("DELETE /lists/{listID}/editors/{username}", h.requireAuth(h.revokeEditor))
-	mux.HandleFunc("GET /lists/{listID}/todos", h.requireAuth(h.listTodos))
-	mux.HandleFunc("POST /lists/{listID}/todos", h.requireAuth(h.createTodo))
-	mux.HandleFunc("GET /lists/{listID}/todos/{id}", h.requireAuth(h.getTodo))
-	mux.HandleFunc("PUT /lists/{listID}/todos/{id}", h.requireAuth(h.updateTodo))
-	mux.HandleFunc("DELETE /lists/{listID}/todos/{id}", h.requireAuth(h.deleteTodo))
-
-	return mux
+// newHumaAPI creates and configures a Huma API on the provided mux, registers
+// authentication middleware and all routes, and returns the huma.API instance.
+func newHumaAPI(mux *http.ServeMux, store *Store, userStore *UserStore, sessionStore *SessionStore) huma.API {
+	config := huma.DefaultConfig("Todo API", "1.0.0")
+	config.Components.SecuritySchemes = map[string]*huma.SecurityScheme{
+		"bearer": {
+			Type:         "http",
+			Scheme:       "bearer",
+			BearerFormat: "JWT",
+		},
+	}
+	api := humago.New(mux, config)
+	api.UseMiddleware(authMiddleware(api, sessionStore))
+	addRoutes(api, store, userStore, sessionStore)
+	return api
 }
 
 func main() {
-	store := NewStore()
-	userStore := NewUserStore()
-	sessionStore := NewSessionStore()
-	h := NewHandler(store, userStore, sessionStore)
+	cli := humacli.New(func(hooks humacli.Hooks, options *Options) {
+		store := NewStore()
+		userStore := NewUserStore()
+		sessionStore := NewSessionStore()
 
-	mux := newMux(h)
+		mux := http.NewServeMux()
+		newHumaAPI(mux, store, userStore, sessionStore)
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
-	}
-	addr := ":" + port
-	log.Printf("Server listening on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
-		log.Fatal(err)
-	}
+		hooks.OnStart(func() {
+			if err := http.ListenAndServe(fmt.Sprintf(":%d", options.Port), mux); err != nil {
+				panic(err)
+			}
+		})
+	})
+	cli.Run()
 }

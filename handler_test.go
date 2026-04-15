@@ -21,9 +21,11 @@ func setUp(t *testing.T) *testEnv {
 	store := NewStore()
 	userStore := NewUserStore()
 	sessionStore := NewSessionStore()
-	h := NewHandler(store, userStore, sessionStore)
 
-	srv := httptest.NewServer(newMux(h))
+	mux := http.NewServeMux()
+	newHumaAPI(mux, store, userStore, sessionStore)
+
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &testEnv{t: t, url: srv.URL}
 }
@@ -219,7 +221,7 @@ func TestRegister_PasswordMinimumLength(t *testing.T) {
 		"username": "bob",
 		"password": "short77",
 	}, "")
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 func TestRegister_MissingUsername(t *testing.T) {
@@ -227,7 +229,7 @@ func TestRegister_MissingUsername(t *testing.T) {
 	resp := env.do("POST", "/users", map[string]string{
 		"password": "password123",
 	}, "")
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 func TestDeleteUser_OwnAccount(t *testing.T) {
@@ -396,7 +398,7 @@ func TestCreateList_NameRequired(t *testing.T) {
 	token := env.mustLogin("alice", "password123")
 
 	resp := env.do("POST", "/lists", map[string]string{"name": ""}, token)
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 func TestListLists_OnlyOwnedOrShared(t *testing.T) {
@@ -679,7 +681,7 @@ func TestTodo_TitleRequired(t *testing.T) {
 
 	resp := env.do("POST", fmt.Sprintf("/lists/%d/todos", listID),
 		map[string]string{"title": ""}, token)
-	assertStatus(t, resp, http.StatusBadRequest)
+	assertStatus(t, resp, http.StatusUnprocessableEntity)
 }
 
 func TestTodo_ListAll(t *testing.T) {

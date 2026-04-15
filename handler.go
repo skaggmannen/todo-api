@@ -2,17 +2,24 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
+	"strings"
 
+	"github.com/danielgtaylor/huma/v2"
 	"golang.org/x/crypto/bcrypt"
 )
 
+// --- Context keys ---
+
 type contextKey int
 
-const contextKeyUserID contextKey = iota
+const (
+	contextKeyUserID contextKey = iota
+	contextKeyToken
+)
+
+// --- Handler ---
 
 type Handler struct {
 	store        *Store
@@ -20,385 +27,464 @@ type Handler struct {
 	sessionStore *SessionStore
 }
 
-func NewHandler(store *Store, userStore *UserStore, sessionStore *SessionStore) *Handler {
-	return &Handler{store: store, userStore: userStore, sessionStore: sessionStore}
-}
+// --- Auth middleware ---
 
-// requireAuth is middleware that validates the Bearer token and injects the
-// authenticated user's ID into the request context.
-func (h *Handler) requireAuth(next http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		token := bearerToken(r)
-		if token == "" {
-			writeError(w, http.StatusUnauthorized, "authentication required")
+// authMiddleware validates Bearer tokens for operations that declare
+// "bearer" security, and injects the authenticated user ID and raw token into
+// the request context.
+func authMiddleware(api huma.API, sessions *SessionStore) func(huma.Context, func(huma.Context)) {
+	return func(ctx huma.Context, next func(huma.Context)) {
+		required := false
+		for _, scheme := range ctx.Operation().Security {
+			if _, ok := scheme["bearer"]; ok {
+				required = true
+				break
+			}
+		}
+		if !required {
+			next(ctx)
 			return
 		}
-		userID, ok := h.sessionStore.Lookup(token)
+
+		authHeader := ctx.Header("Authorization")
+		const prefix = "Bearer "
+		if !strings.HasPrefix(authHeader, prefix) || len(authHeader) == len(prefix) {
+			huma.WriteErr(api, ctx, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		token := authHeader[len(prefix):]
+
+		userID, ok := sessions.Lookup(token)
 		if !ok {
-			writeError(w, http.StatusUnauthorized, "invalid or expired session")
+			huma.WriteErr(api, ctx, http.StatusUnauthorized, "invalid or expired session")
 			return
 		}
-		ctx := context.WithValue(r.Context(), contextKeyUserID, userID)
-		next(w, r.WithContext(ctx))
+
+		ctx = huma.WithValue(ctx, contextKeyUserID, userID)
+		ctx = huma.WithValue(ctx, contextKeyToken, token)
+		next(ctx)
 	}
 }
 
-// contextUserID retrieves the authenticated user's ID from the request context.
-func contextUserID(r *http.Request) int {
-	id, _ := r.Context().Value(contextKeyUserID).(int)
-	return id
+// --- Input / output types ---
+
+// Users
+type RegisterUserInput struct {
+	Body struct {
+		Username string `json:"username" minLength:"1" doc:"Unique username"`
+		Password string `json:"password" minLength:"8" doc:"Password (minimum 8 characters)"`
+	}
+}
+type RegisterUserOutput struct{ Body User }
+
+type GetUserInput struct {
+	ID int `path:"id" doc:"User ID"`
+}
+type GetUserOutput struct{ Body User }
+
+type DeleteUserInput struct {
+	ID int `path:"id" doc:"User ID"`
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+// Sessions
+type LoginInput struct {
+	Body struct {
+		Username string `json:"username" minLength:"1"`
+		Password string `json:"password" minLength:"1"`
+	}
+}
+type LoginResponseBody struct {
+	Token string `json:"token"`
+	User  User   `json:"user"`
+}
+type LoginOutput struct{ Body LoginResponseBody }
+
+// Lists
+type CreateListInput struct {
+	Body struct {
+		Name string `json:"name" minLength:"1" doc:"List name"`
+	}
+}
+type CreateListOutput struct{ Body TodoList }
+
+type DeleteListInput struct {
+	ListID int `path:"listID" doc:"List ID"`
 }
 
-func writeError(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+type ListListsOutput struct{ Body []TodoList }
+
+// Editors
+type InviteEditorInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+	Body   struct {
+		Username string `json:"username" minLength:"1" doc:"Username to invite"`
+	}
 }
 
-func parseListID(r *http.Request) (int, bool) {
-	id, err := strconv.Atoi(r.PathValue("listID"))
-	return id, err == nil
+type RevokeEditorInput struct {
+	ListID   int    `path:"listID" doc:"List ID"`
+	Username string `path:"username" doc:"Username to revoke"`
 }
 
-// resolveOwnedList parses the listID from the path and verifies the list
-// exists and belongs to the authenticated user. On failure it writes the
-// appropriate error response and returns (0, false).
-func (h *Handler) resolveOwnedList(w http.ResponseWriter, r *http.Request) (int, bool) {
-	listID, ok := parseListID(r)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid list id")
-		return 0, false
+// Todos
+type ListTodosInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+}
+type ListTodosOutput struct{ Body []Todo }
+
+type GetTodoInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+	ID     int `path:"id" doc:"Todo ID"`
+}
+type GetTodoOutput struct{ Body Todo }
+
+type CreateTodoInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+	Body   struct {
+		Title string `json:"title" minLength:"1" doc:"Todo title"`
 	}
-	list, ok := h.store.GetList(listID)
-	if !ok || list.OwnerID != contextUserID(r) {
-		writeError(w, http.StatusNotFound, "list not found")
-		return 0, false
+}
+type CreateTodoOutput struct{ Body Todo }
+
+type UpdateTodoInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+	ID     int `path:"id" doc:"Todo ID"`
+	Body   struct {
+		Title     string `json:"title" minLength:"1" doc:"Todo title"`
+		Completed bool   `json:"completed" doc:"Completion status"`
 	}
-	return listID, true
+}
+type UpdateTodoOutput struct{ Body Todo }
+
+type DeleteTodoInput struct {
+	ListID int `path:"listID" doc:"List ID"`
+	ID     int `path:"id" doc:"Todo ID"`
 }
 
-// resolveEditableList parses the listID from the path and verifies the list
-// exists and the authenticated user is the owner or an invited editor.
-func (h *Handler) resolveEditableList(w http.ResponseWriter, r *http.Request) (int, bool) {
-	listID, ok := parseListID(r)
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid list id")
-		return 0, false
-	}
-	userID := contextUserID(r)
-	list, ok := h.store.GetList(listID)
-	if !ok {
-		writeError(w, http.StatusNotFound, "list not found")
-		return 0, false
-	}
-	if list.OwnerID != userID && !h.store.IsEditor(listID, userID) {
-		writeError(w, http.StatusNotFound, "list not found")
-		return 0, false
-	}
-	return listID, true
-}
+// --- Handlers ---
 
-func (h *Handler) listLists(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, h.store.ListsAccessibleTo(contextUserID(r)))
-}
-
-func (h *Handler) createList(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Name string `json:"name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Name == "" {
-		writeError(w, http.StatusBadRequest, "name is required")
-		return
-	}
-	list := h.store.CreateList(contextUserID(r), body.Name)
-	writeJSON(w, http.StatusCreated, list)
-}
-
-func (h *Handler) deleteList(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveOwnedList(w, r)
-	if !ok {
-		return
-	}
-	h.store.DeleteList(listID)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) inviteEditor(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveOwnedList(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Username string `json:"username"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Username == "" {
-		writeError(w, http.StatusBadRequest, "username is required")
-		return
-	}
-	user, ok := h.userStore.GetByUsername(body.Username)
-	if !ok {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-	if user.ID == contextUserID(r) {
-		writeError(w, http.StatusBadRequest, "cannot invite yourself")
-		return
-	}
-	h.store.AddEditor(listID, user.ID)
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) revokeEditor(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveOwnedList(w, r)
-	if !ok {
-		return
-	}
-	username := r.PathValue("username")
-	if username == "" {
-		writeError(w, http.StatusBadRequest, "username is required")
-		return
-	}
-	user, ok := h.userStore.GetByUsername(username)
-	if !ok {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-	if !h.store.RemoveEditor(listID, user.ID) {
-		writeError(w, http.StatusNotFound, "editor not found")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) listTodos(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveEditableList(w, r)
-	if !ok {
-		return
-	}
-	todos, _ := h.store.List(listID)
-	writeJSON(w, http.StatusOK, todos)
-}
-
-func (h *Handler) getTodo(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveEditableList(w, r)
-	if !ok {
-		return
-	}
-	id, err := strconv.Atoi(r.PathValue("id"))
+func (h *Handler) registerUser(ctx context.Context, input *RegisterUserInput) (*RegisterUserOutput, error) {
+	hash, err := bcrypt.GenerateFromPassword([]byte(input.Body.Password), bcrypt.DefaultCost)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
+		return nil, huma.Error500InternalServerError("could not process request")
 	}
-	todo, ok := h.store.Get(listID, id)
-	if !ok {
-		writeError(w, http.StatusNotFound, "todo not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, todo)
-}
-
-func (h *Handler) createTodo(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveEditableList(w, r)
-	if !ok {
-		return
-	}
-	var body struct {
-		Title string `json:"title"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Title == "" {
-		writeError(w, http.StatusBadRequest, "title is required")
-		return
-	}
-	todo, ok := h.store.Create(listID, body.Title)
-	if !ok {
-		writeError(w, http.StatusNotFound, "list not found")
-		return
-	}
-	writeJSON(w, http.StatusCreated, todo)
-}
-
-func (h *Handler) updateTodo(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveEditableList(w, r)
-	if !ok {
-		return
-	}
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
-	}
-	var body struct {
-		Title     string `json:"title"`
-		Completed bool   `json:"completed"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Title == "" {
-		writeError(w, http.StatusBadRequest, "title is required")
-		return
-	}
-	todo, ok := h.store.Update(listID, id, body.Title, body.Completed)
-	if !ok {
-		writeError(w, http.StatusNotFound, "todo not found")
-		return
-	}
-	writeJSON(w, http.StatusOK, todo)
-}
-
-func (h *Handler) deleteTodo(w http.ResponseWriter, r *http.Request) {
-	listID, ok := h.resolveEditableList(w, r)
-	if !ok {
-		return
-	}
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid id")
-		return
-	}
-	if !h.store.Delete(listID, id) {
-		writeError(w, http.StatusNotFound, "todo not found")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
-}
-
-func (h *Handler) registerUser(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	if body.Username == "" {
-		writeError(w, http.StatusBadRequest, "username is required")
-		return
-	}
-	if len(body.Password) < 8 {
-		writeError(w, http.StatusBadRequest, "password must be at least 8 characters")
-		return
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(body.Password), bcrypt.DefaultCost)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not process request")
-		return
-	}
-	user, err := h.userStore.CreateUser(body.Username, string(hash))
+	user, err := h.userStore.CreateUser(input.Body.Username, string(hash))
 	if errors.Is(err, ErrUsernameTaken) {
-		writeError(w, http.StatusConflict, "username already taken")
-		return
+		return nil, huma.Error409Conflict("username already taken")
 	}
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create user")
-		return
+		return nil, huma.Error500InternalServerError("could not create user")
 	}
-	writeJSON(w, http.StatusCreated, user)
+	return &RegisterUserOutput{Body: user}, nil
 }
 
-func (h *Handler) getUser(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid user id")
-		return
+func (h *Handler) getUser(ctx context.Context, input *GetUserInput) (*GetUserOutput, error) {
+	if input.ID != ctx.Value(contextKeyUserID).(int) {
+		return nil, huma.Error403Forbidden("access denied")
 	}
-	if id != contextUserID(r) {
-		writeError(w, http.StatusForbidden, "access denied")
-		return
-	}
-	user, ok := h.userStore.GetByID(id)
+	user, ok := h.userStore.GetByID(input.ID)
 	if !ok {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
+		return nil, huma.Error404NotFound("user not found")
 	}
-	writeJSON(w, http.StatusOK, user)
+	return &GetUserOutput{Body: user}, nil
 }
 
-func (h *Handler) deleteUser(w http.ResponseWriter, r *http.Request) {
-	id, err := strconv.Atoi(r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid user id")
-		return
+func (h *Handler) deleteUser(ctx context.Context, input *DeleteUserInput) (*struct{}, error) {
+	if input.ID != ctx.Value(contextKeyUserID).(int) {
+		return nil, huma.Error403Forbidden("access denied")
 	}
-	if id != contextUserID(r) {
-		writeError(w, http.StatusForbidden, "access denied")
-		return
+	if !h.userStore.DeleteUser(input.ID) {
+		return nil, huma.Error404NotFound("user not found")
 	}
-	if !h.userStore.DeleteUser(id) {
-		writeError(w, http.StatusNotFound, "user not found")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	return nil, nil
 }
 
-func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
-	var body struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid request body")
-		return
-	}
-	user, ok := h.userStore.GetByUsername(body.Username)
+func (h *Handler) login(ctx context.Context, input *LoginInput) (*LoginOutput, error) {
+	user, ok := h.userStore.GetByUsername(input.Body.Username)
 	if !ok {
-		// Use a constant-time failure to avoid username enumeration.
-		bcrypt.CompareHashAndPassword([]byte("$2a$10$invalid.hash.padding.to.avoid.timing"), []byte(body.Password)) //nolint:errcheck
-		writeError(w, http.StatusUnauthorized, "invalid credentials")
-		return
+		// Constant-time failure to avoid username enumeration.
+		bcrypt.CompareHashAndPassword([]byte("$2a$10$invalid.hash.padding.to.avoid.timing"), []byte(input.Body.Password)) //nolint:errcheck
+		return nil, huma.Error401Unauthorized("invalid credentials")
 	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(body.Password)); err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid credentials")
-		return
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(input.Body.Password)); err != nil {
+		return nil, huma.Error401Unauthorized("invalid credentials")
 	}
 	token, err := h.sessionStore.Create(user.ID)
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, "could not create session")
-		return
+		return nil, huma.Error500InternalServerError("could not create session")
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{
-		"token": token,
-		"user":  user,
-	})
+	return &LoginOutput{Body: LoginResponseBody{Token: token, User: user}}, nil
 }
 
-func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
-	token := bearerToken(r)
-	if token == "" {
-		writeError(w, http.StatusBadRequest, "missing authorization token")
-		return
-	}
-	if !h.sessionStore.Delete(token) {
-		writeError(w, http.StatusUnauthorized, "invalid or expired session")
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+func (h *Handler) logout(ctx context.Context, _ *struct{}) (*struct{}, error) {
+	token, _ := ctx.Value(contextKeyToken).(string)
+	h.sessionStore.Delete(token)
+	return nil, nil
 }
 
-// bearerToken extracts the token from an "Authorization: Bearer <token>" header.
-func bearerToken(r *http.Request) string {
-	const prefix = "Bearer "
-	v := r.Header.Get("Authorization")
-	if len(v) <= len(prefix) {
-		return ""
+func (h *Handler) listLists(ctx context.Context, _ *struct{}) (*ListListsOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	return &ListListsOutput{Body: h.store.ListsAccessibleTo(userID)}, nil
+}
+
+func (h *Handler) createList(ctx context.Context, input *CreateListInput) (*CreateListOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list := h.store.CreateList(userID, input.Body.Name)
+	return &CreateListOutput{Body: list}, nil
+}
+
+func (h *Handler) deleteList(ctx context.Context, input *DeleteListInput) (*struct{}, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || list.OwnerID != userID {
+		return nil, huma.Error404NotFound("list not found")
 	}
-	return v[len(prefix):]
+	h.store.DeleteList(input.ListID)
+	return nil, nil
+}
+
+func (h *Handler) inviteEditor(ctx context.Context, input *InviteEditorInput) (*struct{}, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || list.OwnerID != userID {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	user, ok := h.userStore.GetByUsername(input.Body.Username)
+	if !ok {
+		return nil, huma.Error404NotFound("user not found")
+	}
+	if user.ID == userID {
+		return nil, huma.Error400BadRequest("cannot invite yourself")
+	}
+	h.store.AddEditor(input.ListID, user.ID)
+	return nil, nil
+}
+
+func (h *Handler) revokeEditor(ctx context.Context, input *RevokeEditorInput) (*struct{}, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || list.OwnerID != userID {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	user, ok := h.userStore.GetByUsername(input.Username)
+	if !ok {
+		return nil, huma.Error404NotFound("user not found")
+	}
+	if !h.store.RemoveEditor(input.ListID, user.ID) {
+		return nil, huma.Error404NotFound("editor not found")
+	}
+	return nil, nil
+}
+
+func (h *Handler) listTodos(ctx context.Context, input *ListTodosInput) (*ListTodosOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || (list.OwnerID != userID && !h.store.IsEditor(input.ListID, userID)) {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	todos, _ := h.store.List(input.ListID)
+	return &ListTodosOutput{Body: todos}, nil
+}
+
+func (h *Handler) getTodo(ctx context.Context, input *GetTodoInput) (*GetTodoOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || (list.OwnerID != userID && !h.store.IsEditor(input.ListID, userID)) {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	todo, ok := h.store.Get(input.ListID, input.ID)
+	if !ok {
+		return nil, huma.Error404NotFound("todo not found")
+	}
+	return &GetTodoOutput{Body: todo}, nil
+}
+
+func (h *Handler) createTodo(ctx context.Context, input *CreateTodoInput) (*CreateTodoOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || (list.OwnerID != userID && !h.store.IsEditor(input.ListID, userID)) {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	todo, ok := h.store.Create(input.ListID, input.Body.Title)
+	if !ok {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	return &CreateTodoOutput{Body: todo}, nil
+}
+
+func (h *Handler) updateTodo(ctx context.Context, input *UpdateTodoInput) (*UpdateTodoOutput, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || (list.OwnerID != userID && !h.store.IsEditor(input.ListID, userID)) {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	todo, ok := h.store.Update(input.ListID, input.ID, input.Body.Title, input.Body.Completed)
+	if !ok {
+		return nil, huma.Error404NotFound("todo not found")
+	}
+	return &UpdateTodoOutput{Body: todo}, nil
+}
+
+func (h *Handler) deleteTodo(ctx context.Context, input *DeleteTodoInput) (*struct{}, error) {
+	userID := ctx.Value(contextKeyUserID).(int)
+	list, ok := h.store.GetList(input.ListID)
+	if !ok || (list.OwnerID != userID && !h.store.IsEditor(input.ListID, userID)) {
+		return nil, huma.Error404NotFound("list not found")
+	}
+	if !h.store.Delete(input.ListID, input.ID) {
+		return nil, huma.Error404NotFound("todo not found")
+	}
+	return nil, nil
+}
+
+// --- Route registration ---
+
+var bearerSecurity = []map[string][]string{{"bearer": []string{}}}
+
+// addRoutes registers all API operations against the provided huma.API.
+func addRoutes(api huma.API, store *Store, userStore *UserStore, sessionStore *SessionStore) {
+	h := &Handler{store: store, userStore: userStore, sessionStore: sessionStore}
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "register-user",
+		Method:        http.MethodPost,
+		Path:          "/users",
+		Summary:       "Register a new user",
+		Tags:          []string{"Users"},
+		DefaultStatus: http.StatusCreated,
+	}, h.registerUser)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-user",
+		Method:      http.MethodGet,
+		Path:        "/users/{id}",
+		Summary:     "Get a user by ID",
+		Tags:        []string{"Users"},
+		Security:    bearerSecurity,
+	}, h.getUser)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-user",
+		Method:        http.MethodDelete,
+		Path:          "/users/{id}",
+		Summary:       "Delete a user",
+		Tags:          []string{"Users"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.deleteUser)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "login",
+		Method:        http.MethodPost,
+		Path:          "/sessions",
+		Summary:       "Login and create a session",
+		Tags:          []string{"Auth"},
+		DefaultStatus: http.StatusCreated,
+	}, h.login)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "logout",
+		Method:        http.MethodDelete,
+		Path:          "/sessions",
+		Summary:       "Logout and invalidate the session",
+		Tags:          []string{"Auth"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.logout)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-lists",
+		Method:      http.MethodGet,
+		Path:        "/lists",
+		Summary:     "List all accessible todo lists",
+		Tags:        []string{"Lists"},
+		Security:    bearerSecurity,
+	}, h.listLists)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-list",
+		Method:        http.MethodPost,
+		Path:          "/lists",
+		Summary:       "Create a todo list",
+		Tags:          []string{"Lists"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusCreated,
+	}, h.createList)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-list",
+		Method:        http.MethodDelete,
+		Path:          "/lists/{listID}",
+		Summary:       "Delete a todo list",
+		Tags:          []string{"Lists"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.deleteList)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "invite-editor",
+		Method:        http.MethodPost,
+		Path:          "/lists/{listID}/editors",
+		Summary:       "Invite a user as an editor",
+		Tags:          []string{"Lists"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.inviteEditor)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "revoke-editor",
+		Method:        http.MethodDelete,
+		Path:          "/lists/{listID}/editors/{username}",
+		Summary:       "Revoke editor access",
+		Tags:          []string{"Lists"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.revokeEditor)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "list-todos",
+		Method:      http.MethodGet,
+		Path:        "/lists/{listID}/todos",
+		Summary:     "List todos in a list",
+		Tags:        []string{"Todos"},
+		Security:    bearerSecurity,
+	}, h.listTodos)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "create-todo",
+		Method:        http.MethodPost,
+		Path:          "/lists/{listID}/todos",
+		Summary:       "Create a todo in a list",
+		Tags:          []string{"Todos"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusCreated,
+	}, h.createTodo)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "get-todo",
+		Method:      http.MethodGet,
+		Path:        "/lists/{listID}/todos/{id}",
+		Summary:     "Get a todo by ID",
+		Tags:        []string{"Todos"},
+		Security:    bearerSecurity,
+	}, h.getTodo)
+
+	huma.Register(api, huma.Operation{
+		OperationID: "update-todo",
+		Method:      http.MethodPut,
+		Path:        "/lists/{listID}/todos/{id}",
+		Summary:     "Update a todo",
+		Tags:        []string{"Todos"},
+		Security:    bearerSecurity,
+	}, h.updateTodo)
+
+	huma.Register(api, huma.Operation{
+		OperationID:   "delete-todo",
+		Method:        http.MethodDelete,
+		Path:          "/lists/{listID}/todos/{id}",
+		Summary:       "Delete a todo",
+		Tags:          []string{"Todos"},
+		Security:      bearerSecurity,
+		DefaultStatus: http.StatusNoContent,
+	}, h.deleteTodo)
 }
