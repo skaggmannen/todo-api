@@ -1,0 +1,41 @@
+stages:
+  - test
+  - release
+
+test:
+  stage: test
+  image: golang:1.26
+  extends: .go-cache
+  script:
+    - go vet
+    - go test -v ./...
+
+vulncheck:
+  stage: test
+  image: golang:1.26
+  extends: .go-cache
+  script:
+    - go tool govulncheck ./...
+  allow_failure: true
+
+release:
+  stage: release
+  image: golang:1.26
+  extends: .go-cache
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+  before_script:
+    - go tool ko login $CI_REGISTRY -u $CI_REGISTRY_USER --password-stdin <<< "$CI_REGISTRY_PASSWORD"
+  script:
+    - KO_DOCKER_REPO=$CI_REGISTRY_IMAGE go tool ko build --tags $CI_COMMIT_TAG,latest --bare .
+
+.go-cache:
+  variables:
+    GOPATH: $CI_PROJECT_DIR/.go
+  cache:
+    key:
+      files:
+        - go.mod
+        - go.sum
+    paths:
+      - .go/pkg/mod/

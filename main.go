@@ -41,6 +41,8 @@ func main() {
 		newHumaAPI(mux, store, userStore, sessionStore)
 
 		hooks.OnStart(func() {
+			fmt.Printf("Starting server on port %d...\n", options.Port)
+			fmt.Printf("API documentation available at http://localhost:%d/docs\n", options.Port)
 			if err := http.ListenAndServe(fmt.Sprintf(":%d", options.Port), mux); err != nil {
 				panic(err)
 			}
